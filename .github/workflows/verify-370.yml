@@ -22,10 +22,13 @@ jobs:
           done
       - name: clippy and unit tests for kiri-init on Linux (main vs the fix)
         run: |
+          set +e
           for e in base head; do
             docker run --rm --privileged -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
-              'apk add -q musl-dev && rustup component add clippy >/dev/null 2>&1; cargo clippy --locked -p kiri-init --all-targets 2>&1 | grep -E "^(warning|error)" | sort | uniq -c | sort -rn > /src/clippy.txt; cargo test --locked -p kiri-init 2>&1 | grep -E "^test result|FAILED|panicked" > /src/test.txt'
-            echo "== $e clippy:"; cat $e/clippy.txt; echo "== $e tests:"; cat $e/test.txt
+              'apk add -q musl-dev; rustup component add clippy >/dev/null 2>&1; cargo clippy --locked -p kiri-init --all-targets > /src/clippy-full.txt 2>&1; echo "clippy exit $?" >> /src/clippy-full.txt; cargo test --locked -p kiri-init > /src/test-full.txt 2>&1; echo "test exit $?" >> /src/test-full.txt'
+            grep -E "^(warning|error)" $e/clippy-full.txt | sort | uniq -c | sort -rn > $e/clippy.txt
+            echo "== $e clippy:"; cat $e/clippy.txt; tail -3 $e/clippy-full.txt
+            echo "== $e tests:"; grep -E "^test result|FAILED|panicked|test exit" $e/test-full.txt; tail -15 $e/test-full.txt
           done
           echo "== clippy lines only on the fix:"; diff <(sort base/clippy.txt) <(sort head/clippy.txt) | grep '^>' || echo none
       - name: Start both engines
