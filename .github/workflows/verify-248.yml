@@ -19,7 +19,7 @@ jobs:
         run: |
           set +e
           W=$RUNNER_TEMP/run; mkdir -p "$W"
-          docker run -d --name kiri --privileged --tmpfs /run -v "$RUNNER_TEMP/base-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
+          docker run -d --name kiri --privileged --tmpfs /run -v kiri-lib:/var/lib/kiri -v kiri-store:/root/.local/share/kiri -v "$RUNNER_TEMP/base-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
             alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
           i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
           D="sudo docker -H unix://$W/docker.sock"
