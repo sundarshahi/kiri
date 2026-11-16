@@ -2061,6 +2061,8 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
             "Devices": super::hostopts::inspect(&c.spec.host_opts, "Devices"),
             "DeviceCgroupRules": super::hostopts::inspect(&c.spec.host_opts, "DeviceCgroupRules"),
             "GroupAdd": super::hostopts::inspect(&c.spec.host_opts, "GroupAdd"),
+            "MaskedPaths": super::hostopts::system_paths(&c.spec.host_opts, "MaskedPaths", c.spec.privileged),
+            "ReadonlyPaths": super::hostopts::system_paths(&c.spec.host_opts, "ReadonlyPaths", c.spec.privileged),
         },
         "NetworkSettings": network_settings(c, nets),
         "Mounts": c.spec.mount_info,
