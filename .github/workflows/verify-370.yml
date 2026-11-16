@@ -4,6 +4,7 @@ on:
     branches: [verify/370]
 jobs:
   verify:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -98,4 +99,36 @@ jobs:
         if: always()
         with:
           name: logs
+          path: ${{ runner.temp }}/*.log
+  e2e-fix-fresh-runner:
+    # The first job's second e2e hit Docker Hub's pull limit; the fix again on its own runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head }
+      - name: Build the fix
+        run: |
+          mkdir -p "$RUNNER_TEMP/head-bin"
+          docker run --rm -v "$PWD/head:/src" -v "$RUNNER_TEMP/head-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+            -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+            'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+      - name: Start the engine
+        run: |
+          W=$RUNNER_TEMP/head-run; mkdir -p "$W"
+          docker run -d --name kiri-head --privileged --tmpfs /run -v kiri-lib-head:/var/lib/kiri -v kiri-store-head:/root/.local/share/kiri \
+            -v "$RUNNER_TEMP/head-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+          i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+          sudo docker context create kiri-head --docker host=unix://$W/docker.sock >/dev/null
+      - name: Full e2e suite on the fix
+        run: |
+          set +e
+          ( cd head && sudo env DOCKER_CONTEXT=kiri-head timeout 3000 bash tests/e2e.sh > $RUNNER_TEMP/e2e-head2.log 2>&1 )
+          echo "e2e exit=$?"; echo "rate-limited pulls: $(grep -c TOOMANYREQUESTS $RUNNER_TEMP/e2e-head2.log)"
+          grep -E "passed,|^  failed" $RUNNER_TEMP/e2e-head2.log
+          grep -n "workdir" $RUNNER_TEMP/e2e-head2.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-fix
           path: ${{ runner.temp }}/*.log
