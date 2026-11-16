@@ -64,7 +64,7 @@ jobs:
           row "--user 1000 -w /tmp (exists)" run --rm --user 1000 -w /tmp alpine:3.21 pwd
           row "image WORKDIR exists (httpd), root" run --rm httpd:2.4-alpine pwd
           row "image WORKDIR exists (httpd), --user 1000" run --rm --user 1000 httpd:2.4-alpine pwd
-          row "--user 1000 -w /root (exists, 0700 root)" run --rm --user 1000 -w /root alpine:3.21 pwd
+          row "--user 1000 -w /root (exists, 0700 root; not changed)" run --rm --user 1000 -w /root alpine:3.21 pwd
           row "named volume: -v v370:/data -w /data/sub --user 1000" run --rm --user 1000 -v v370:/data -w /data/sub alpine:3.21 sh -c "pwd; $ST /data/sub"
           row "anonymous volume: -v /data -w /data/sub --user 1000" run --rm --user 1000 -v /data -w /data/sub alpine:3.21 sh -c "pwd; $ST /data/sub"
           row "bind: -v /tmp:/h -w /h/wd370/sub --user 1000" run --rm --user 1000 -v /tmp:/h -w /h/wd370-$RANDOM/sub alpine:3.21 sh -c "pwd; $ST ."
