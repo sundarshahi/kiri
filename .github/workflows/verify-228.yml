@@ -46,7 +46,7 @@ jobs:
             docker run -d --name kiri-$e --privileged --tmpfs /run -v "$RUNNER_TEMP/$e-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
               alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
             i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
-            D="docker -H unix://$W/docker.sock"
+            D="sudo docker -H unix://$W/docker.sock"
             docker exec kiri-$e sh -c 'gw=$(ip route | awk "/^default/{print \$3}"); ip route add 0.0.0.0/1 via $gw; ip route add 128.0.0.0/1 via $gw; ip -4 route'
             for n in 1 2 3; do
               start=$(date +%s%N)
