@@ -59,6 +59,16 @@ jobs:
             echo "$e: cat with stdin closed at 4s -> exit=$rc after $(( $(date +%s)-start ))s output=$(cat /tmp/cat-$e | tr '\n' ' ')"
             $D rm -f keeper3 catter >/dev/null 2>&1
           done
+      - name: An --init container's own stdin, 3 times each
+        run: |
+          set +e
+          for e in base head; do
+            for n in 1 2 3; do
+              t0=$(date +%s%N)
+              out=$(echo x | timeout 20 sudo docker --context kiri-$e run -i --rm --init alpine:3.21 cat 2>&1); rc=$?
+              echo "$e run $n: echo x | docker run -i --init alpine cat -> exit=$rc output=[$out] $(( ($(date +%s%N)-t0)/1000000 )) ms"
+            done
+          done
       - name: --init itself still behaves
         run: |
           set +e
