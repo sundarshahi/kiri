@@ -1,0 +1,98 @@
+name: verify-370
+on:
+  push:
+    branches: [verify/370]
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head }
+      - uses: actions/checkout@v4
+        with: { path: base, ref: 231d2301865add70ac4bbac6beef01d94e0e95da, repository: libracoder/kiri }
+      - name: Build main and the fix
+        run: |
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            mkdir -p "$RUNNER_TEMP/$e-bin"
+            docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/$e-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+              -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+          done
+      - name: clippy and unit tests for kiri-init on Linux (main vs the fix)
+        run: |
+          for e in base head; do
+            docker run --rm --privileged -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && rustup component add clippy >/dev/null 2>&1; cargo clippy --locked -p kiri-init --all-targets 2>&1 | grep -E "^(warning|error)" | sort | uniq -c | sort -rn > /src/clippy.txt; cargo test --locked -p kiri-init 2>&1 | grep -E "^test result|FAILED|panicked" > /src/test.txt'
+            echo "== $e clippy:"; cat $e/clippy.txt; echo "== $e tests:"; cat $e/test.txt
+          done
+          echo "== clippy lines only on the fix:"; diff <(sort base/clippy.txt) <(sort head/clippy.txt) | grep '^>' || echo none
+      - name: Start both engines
+        run: |
+          for e in base head; do
+            W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+            docker run -d --name kiri-$e --privileged --tmpfs /run -v kiri-lib-$e:/var/lib/kiri -v kiri-store-$e:/root/.local/share/kiri \
+              -v "$RUNNER_TEMP/$e-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+            i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+            sudo docker context create kiri-$e --docker host=unix://$W/docker.sock >/dev/null
+          done
+          for c in default kiri-base kiri-head; do sudo docker --context $c pull -q alpine:3.21 >/dev/null; sudo docker --context $c pull -q httpd:2.4-alpine >/dev/null; done
+      - name: Cases, Docker vs Kiri main vs the fix
+        run: |
+          set +e
+          one() { # engine, command...: "exit N: output" on one line
+            local c=$1; shift
+            local out; out=$(timeout 120 sudo docker --context $c "$@" 2>&1); local rc=$?
+            printf 'exit %s: %s' "$rc" "$(printf %s "$out" | tr '\n' ' ' | sed 's/|/\\|/g' | cut -c1-160)"
+          }
+          row() { # name, command...
+            local name=$1; shift
+            local cells=""
+            for c in default kiri-base kiri-head; do cells="$cells | $(one $c "$@")"; done
+            echo "| $name$cells |" | tee -a $RUNNER_TEMP/table.md
+          }
+          echo "| case | Docker | Kiri main | Kiri fix |" > $RUNNER_TEMP/table.md
+          echo "|---|---|---|---|" >> $RUNNER_TEMP/table.md
+          ST='stat -c "%n %u:%g %a"'
+          for n in 1 2 3; do
+            row "issue: --user 1000:1000 -w /does/not/exist (run $n)" run --rm --user 1000:1000 -w /does/not/exist alpine:3.21 pwd
+          done
+          row "owner and mode of what was made" run --rm --user 1000:1000 -w /does/not/exist alpine:3.21 sh -c "$ST /does /does/not /does/not/exist"
+          row "root, -w /does/not/exist" run --rm -w /does/not/exist alpine:3.21 sh -c "pwd; $ST ."
+          row "-w /new/dir --user 1000" run --rm --user 1000 -w /new/dir alpine:3.21 sh -c "pwd; $ST /new /new/dir"
+          row "--user 1000 -w /tmp (exists)" run --rm --user 1000 -w /tmp alpine:3.21 pwd
+          row "image WORKDIR exists (httpd), root" run --rm httpd:2.4-alpine pwd
+          row "image WORKDIR exists (httpd), --user 1000" run --rm --user 1000 httpd:2.4-alpine pwd
+          row "--user 1000 -w /root (exists, 0700 root)" run --rm --user 1000 -w /root alpine:3.21 pwd
+          row "named volume: -v v370:/data -w /data/sub --user 1000" run --rm --user 1000 -v v370:/data -w /data/sub alpine:3.21 sh -c "pwd; $ST /data/sub"
+          row "anonymous volume: -v /data -w /data/sub --user 1000" run --rm --user 1000 -v /data -w /data/sub alpine:3.21 sh -c "pwd; $ST /data/sub"
+          row "bind: -v /tmp:/h -w /h/wd370/sub --user 1000" run --rm --user 1000 -v /tmp:/h -w /h/wd370-$RANDOM/sub alpine:3.21 sh -c "pwd; $ST ."
+          row "tmpfs: --tmpfs /t -w /t/sub --user 1000" run --rm --user 1000 --tmpfs /t -w /t/sub alpine:3.21 sh -c "pwd; $ST ."
+          row "--read-only --user 1000 -w /made/ro" run --rm --read-only --user 1000 -w /made/ro alpine:3.21 pwd
+          row "WorkingDir is a file, root: -w /etc/passwd" run --rm -w /etc/passwd alpine:3.21 pwd
+          row "WorkingDir is a file, --user 1000" run --rm --user 1000 -w /etc/passwd alpine:3.21 pwd
+          row "WorkingDir under a file: -w /etc/passwd/x" run --rm -w /etc/passwd/x alpine:3.21 pwd
+          for c in default kiri-base kiri-head; do sudo docker --context $c run -d --name x370 alpine:3.21 sleep 600 >/dev/null; done
+          row "exec -w /exec/missing (root)" exec -w /exec/missing x370 pwd
+          row "exec -u 1000 -w /exec/missing2" exec -u 1000 -w /exec/missing2 x370 pwd
+          row "exec -u 1000 -w /root" exec -u 1000 -w /root x370 pwd
+          row "exec -u 1000 -w /tmp" exec -u 1000 -w /tmp x370 pwd
+          for c in default kiri-base kiri-head; do sudo docker --context $c rm -f x370 >/dev/null; sudo docker --context $c volume rm v370 >/dev/null; done
+          cat $RUNNER_TEMP/table.md >> $GITHUB_STEP_SUMMARY
+      - name: Full e2e suite, main vs the fix
+        run: |
+          set +e
+          for e in base head; do
+            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e timeout 3000 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
+            echo "$e e2e exit=$?"; tail -4 $RUNNER_TEMP/e2e-$e.log
+            grep -E "^  FAIL" $RUNNER_TEMP/e2e-$e.log | sed 's/:.*//' | sort > $RUNNER_TEMP/fails-$e
+          done
+          echo "== failing only on the fix:"; comm -13 $RUNNER_TEMP/fails-base $RUNNER_TEMP/fails-head
+          echo "== failing only on main:"; comm -23 $RUNNER_TEMP/fails-base $RUNNER_TEMP/fails-head
+          echo "== workdir lines:"; grep -n "workdir" $RUNNER_TEMP/e2e-*.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: ${{ runner.temp }}/*.log
