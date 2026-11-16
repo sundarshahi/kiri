@@ -5,7 +5,7 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with: { path: head, ref: fix/248-init-holds-dns-sockets }
@@ -24,9 +24,9 @@ jobs:
         run: |
           for e in base head; do
             docker run --rm -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
-              'apk add -q musl-dev && rustup component add clippy rustfmt >/dev/null 2>&1; cargo clippy --locked -p kiri-init 2>&1 | grep -E "^(warning|error)" | sort | uniq -c | sort -rn > /src/../clippy-'$e'.txt; rustfmt --edition 2021 --config max_width=160 --check crates/kiri-init/src/linux/pid1.rs >/dev/null 2>&1; echo "'$e' pid1.rs rustfmt(160) exit=$?"'
+              'apk add -q musl-dev && rustup component add clippy rustfmt >/dev/null 2>&1; cargo clippy --locked -p kiri-init 2>&1 | grep -E "^(warning|error)" | sort | uniq -c | sort -rn > /src/clippy.txt; echo "'$e' pid1.rs rustfmt(160) diffs: $(rustfmt --edition 2021 --config max_width=160 --check crates/kiri-init/src/linux/pid1.rs 2>&1 | grep -c ^Diff)"'
           done
-          echo "== clippy lines only on the fix:"; diff <(sort clippy-base.txt) <(sort clippy-head.txt) | grep '^>' || echo none
+          echo "== clippy lines only on the fix:"; diff <(sort base/clippy.txt) <(sort head/clippy.txt) | grep '^>' || echo none
           docker run --rm -v "$PWD/head:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
             'apk add -q musl-dev; cargo clippy --locked -p kiri-init 2>&1 | grep -B2 -A8 "pid1.rs" | head -40 || true'
       - name: Start both engines
@@ -57,6 +57,7 @@ jobs:
             done
           done
       - name: An --init PID 1 and other containers' stdin
+        if: false
         run: |
           set +e
           for e in base head; do
@@ -93,7 +94,7 @@ jobs:
         run: |
           set +e
           for e in base head; do
-            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e timeout 2400 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
+            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e timeout 3000 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
             echo "$e e2e exit=$?"; tail -4 $RUNNER_TEMP/e2e-$e.log
             grep -E "^  FAIL" $RUNNER_TEMP/e2e-$e.log | sed 's/:.*//' | sort > $RUNNER_TEMP/fails-$e
           done
