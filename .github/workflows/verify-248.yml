@@ -1,0 +1,53 @@
+name: verify-248
+on:
+  push:
+    branches: [verify/248]
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: base, ref: main, repository: libracoder/kiri }
+      - name: Build main (static, as cargo xtask linux)
+        run: |
+          mkdir -p "$RUNNER_TEMP/base-bin"
+          docker run --rm -v "$PWD/base:/src" -v "$RUNNER_TEMP/base-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+            -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+            'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+      - name: Repro
+        run: |
+          set +e
+          W=$RUNNER_TEMP/run; mkdir -p "$W"
+          docker run -d --name kiri --privileged --tmpfs /run -v "$RUNNER_TEMP/base-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
+            alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+          i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+          D="sudo docker -H unix://$W/docker.sock"
+          ls53() { echo "  :53 listeners: $(docker exec kiri netstat -lun 2>/dev/null | awk '$4 ~ /:53$/ {print $4}' | tr '\n' ' ')"; }
+          sub() { $D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$1"; }
+          $D pull -q alpine:3.21 >/dev/null
+          echo "== A: run, rm network, same subnet again (no --init)"
+          $D network create a1 >/dev/null; echo "a1 $(sub a1)"; $D run --rm --network a1 alpine:3.21 true; echo "run a1 exit=$?"
+          $D network rm a1 >/dev/null; ls53
+          $D network create a2 >/dev/null; echo "a2 $(sub a2)"; $D run --rm --network a2 alpine:3.21 true; echo "run a2 exit=$?"
+          $D network rm a2 >/dev/null; ls53
+          echo "== B: an --init container started while b1's DNS server exists"
+          $D network create b1 >/dev/null; echo "b1 $(sub b1)"
+          $D run -d --name b1c --network b1 alpine:3.21 sleep 600 >/dev/null
+          $D run -d --name keeper --init alpine:3.21 sleep 600 >/dev/null
+          $D rm -f b1c >/dev/null; $D network rm b1 >/dev/null; ls53
+          $D network create b2 >/dev/null; echo "b2 $(sub b2)"; $D run --rm --network b2 alpine:3.21 true; echo "run b2 exit=$?"
+          echo "  holders of :53 sockets:"; docker exec kiri sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); n=$(ls -l $p/fd 2>/dev/null | grep -c socket); [ "$n" -gt 0 ] && echo "   pid ${p#/proc/} sockets=$n $c"; done' | head -20
+          $D rm -f keeper >/dev/null; sleep 1; ls53
+          $D run --rm --network b2 alpine:3.21 true; echo "run b2 after keeper gone exit=$?"
+          $D network rm b2 >/dev/null
+          echo "== C: same as B without --init"
+          $D network create c1 >/dev/null; echo "c1 $(sub c1)"
+          $D run -d --name c1c --network c1 alpine:3.21 sleep 600 >/dev/null
+          $D run -d --name keeper2 alpine:3.21 sleep 600 >/dev/null
+          $D rm -f c1c >/dev/null; $D network rm c1 >/dev/null; ls53
+          $D network create c2 >/dev/null; echo "c2 $(sub c2)"; $D run --rm --network c2 alpine:3.21 true; echo "run c2 exit=$?"
+          echo "== D: a failed start"
+          $D network create d1 >/dev/null; echo "d1 $(sub d1)"; $D run --rm --network d1 alpine:3.21 /nonexistent; echo "run d1 exit=$?"
+          $D network rm d1 >/dev/null; ls53
+          $D network create d2 >/dev/null; echo "d2 $(sub d2)"; $D run --rm --network d2 alpine:3.21 true; echo "run d2 exit=$?"
