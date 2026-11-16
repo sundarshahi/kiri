@@ -1,0 +1,74 @@
+name: verify-388
+on:
+  push:
+    branches: [verify/388]
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head, ref: fix/388-port-idle-timeout }
+      - uses: actions/checkout@v4
+        with: { path: base, ref: 231d2301865add70ac4bbac6beef01d94e0e95da, repository: libracoder/kiri }
+      - name: Build main and the fix (static, as cargo xtask linux)
+        run: |
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            mkdir -p "$RUNNER_TEMP/$e-bin"
+            docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/$e-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+              -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+          done
+      - name: Unit tests and clippy (Linux)
+        run: |
+          for e in head base; do
+            find "$e" -type f -exec touch {} +
+            docker run --rm -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t -e E=$e rust:1-alpine sh -c \
+              'apk add -q musl-dev && rustup component add clippy >/dev/null 2>&1; [ $E = head ] && cargo test --locked -p kiri --bin kiri daemon::ports 2>&1 | tail -16; cargo clippy --locked -p kiri --all-targets 2>/tmp/c; echo "$E clippy warnings: $(grep -c "^warning" /tmp/c), in ports.rs: $(grep -c "ports.rs" /tmp/c)"; grep -A3 "^warning" /tmp/c | grep "ports.rs" || true'
+          done
+      - name: Start main and the fix, each with Valkey published on 127.0.0.1:16379
+        run: |
+          cat /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
+          for e in base head; do
+            W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+            docker run -d --name kiri-$e --privileged --tmpfs /run -v kiri-lib-$e:/var/lib/kiri -v kiri-store-$e:/root/.local/share/kiri -v "$RUNNER_TEMP/$e-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
+              alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+            i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+            sudo docker context create kiri-$e --docker "host=unix://$W/docker.sock" >/dev/null
+            sudo docker --context kiri-$e run -d --name idle-test -p 127.0.0.1:16379:6379 valkey/valkey:8-alpine >/dev/null
+            sleep 2
+            echo "$e: valkey timeout = $(sudo docker --context kiri-$e exec idle-test valkey-cli config get timeout | tr '\n' ' ')"
+            docker exec kiri-$e sh -c 'apk add -q iptables >/dev/null 2>&1; netstat -ltnp 2>/dev/null | grep 16379'
+          done
+      - name: Idle 5 s and 320 s, then PING (3 runs each engine, at once)
+        run: |
+          probe() {
+            docker exec kiri-$1 sh -c "s=\$(date +%s); r=\$( (sleep $2; printf 'PING\r\n'; sleep 3) | nc 127.0.0.1 16379 | tr -d '\r'); echo \"$1 run $3 idle $2 s: reply='\$r', connection ended after \$(( \$(date +%s)-s )) s\""
+          }
+          for e in base head; do
+            probe $e 5 control &
+            for n in 1 2 3; do probe $e 320 $n & done
+          done
+          wait
+      - name: Dead peer (relay's packets to the client dropped) is released
+        run: |
+          for e in base head; do
+            (
+              docker exec kiri-$e sh -c '(sleep 400) | nc 127.0.0.1 16379' &
+              sleep 2
+              docker exec kiri-$e iptables -I OUTPUT -o lo -p tcp --sport 16379 -j DROP
+              s=$(date +%s)
+              while :; do
+                n=$(sudo docker --context kiri-$e exec idle-test valkey-cli client list | grep -vc 'addr=127.0.0.1')
+                t=$(( $(date +%s)-s ))
+                if [ "$n" = 0 ]; then echo "$e: dead client's connection released after ~$t s"; break; fi
+                if [ $t -ge 360 ]; then echo "$e: still held after $t s"; break; fi
+                sleep 5
+              done
+              docker exec kiri-$e iptables -D OUTPUT -o lo -p tcp --sport 16379 -j DROP
+            ) &
+          done
+          wait
+          docker logs kiri-head 2>&1 | tail -5
