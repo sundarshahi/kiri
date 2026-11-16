@@ -39,7 +39,12 @@ const RELAY_FRAMED_PORT: u32 = 1030;
 static NO_FRAMED_RELAY: AtomicBool = AtomicBool::new(false);
 /// A UDP client quiet this long has its session closed, as conntrack does.
 const UDP_IDLE: Duration = Duration::from_secs(60);
-const TCP_IDLE: Duration = Duration::from_secs(300);
+/// A relayed TCP connection has no timeout, as with Docker. A peer that went
+/// away is found by keepalive: probed after `KEEPALIVE` quiet, then that
+/// often, and dropped after `KEEPALIVE_PROBES` go unanswered (Go's defaults,
+/// which docker-proxy has).
+const KEEPALIVE: Duration = Duration::from_secs(15);
+const KEEPALIVE_PROBES: libc::c_int = 9;
 const MAX_TCP_SESSIONS: usize = 1024;
 static TCP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// Connections from other machines (a port published on 0.0.0.0 is open
@@ -704,9 +709,6 @@ fn open_framed_relay(vm: &VmLink, ip: [u8; 4], port: u16) -> io::Result<(kiri_vm
 
 fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<SocketAddr>) -> io::Result<()> {
     client.set_nonblocking(false)?;
-    client.set_nodelay(true)?;
-    client.set_read_timeout(Some(TCP_IDLE))?;
-    client.set_write_timeout(Some(TCP_IDLE))?;
     // A Linux host reaches the container's address itself.
     if cfg!(target_os = "linux") {
         return relay_direct(client, ip, port);
@@ -737,8 +739,8 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
             Err(_) => {}
         }
     }
+    relay_socket(&client)?;
     let (guest, framed) = open_framed_relay(vm, ip, port)?;
-    socket_timeouts(guest.fd.as_raw_fd())?;
     let mut to_guest = std::fs::File::from(guest.fd.try_clone()?);
     let mut from_guest = std::fs::File::from(guest.fd.try_clone()?);
     let mut client_read = client.try_clone()?;
@@ -760,9 +762,8 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
 /// A client connection passed on over the NAT network: two sockets, with
 /// each half-close passed on.
 fn relay_tcp(client: TcpStream, guest: TcpStream) -> io::Result<()> {
-    guest.set_nodelay(true)?;
-    guest.set_read_timeout(Some(TCP_IDLE))?;
-    guest.set_write_timeout(Some(TCP_IDLE))?;
+    relay_socket(&client)?;
+    relay_socket(&guest)?;
     let (mut client_read, mut guest_write) = (client.try_clone()?, guest.try_clone()?);
     let up = std::thread::Builder::new().name("kiri-conn-up".into()).spawn(move || {
         let _ = copy(&mut client_read, &mut guest_write);
@@ -787,10 +788,9 @@ const SPLICE_PIPE: libc::c_int = 1 << 20;
 /// moved by splice(2) through a pipe each way (never copied to user space),
 /// one thread per direction, each half-close passed on.
 fn relay_direct(client: TcpStream, ip: [u8; 4], port: u16) -> io::Result<()> {
+    relay_socket(&client)?;
     let target = TcpStream::connect_timeout(&SocketAddr::from((ip, port)), DIRECT_CONNECT)?;
-    target.set_nodelay(true)?;
-    target.set_read_timeout(Some(TCP_IDLE))?;
-    target.set_write_timeout(Some(TCP_IDLE))?;
+    relay_socket(&target)?;
     let (client_read, target_write) = (client.try_clone()?, target.try_clone()?);
     let up = std::thread::Builder::new().name("kiri-conn-up".into()).spawn(move || {
         let _ = splice_all(&client_read, &target_write);
@@ -913,19 +913,22 @@ fn copy_frames(from: &mut impl Read, to: &mut impl Write) -> io::Result<()> {
     }
 }
 
-fn socket_timeouts(fd: std::os::fd::RawFd) -> io::Result<()> {
-    let timeout = libc::timeval {
-        tv_sec: TCP_IDLE.as_secs() as _,
-        tv_usec: 0,
-    };
-    // SAFETY: timeout is valid for the duration of both calls on an owned socket.
-    let result = unsafe {
-        let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-        let read = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), len);
-        let write = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&timeout as *const libc::timeval).cast(), len);
-        read | write
-    };
-    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+/// Either end of a relayed TCP connection: no timeouts, keepalive on.
+fn relay_socket(s: &TcpStream) -> io::Result<()> {
+    s.set_nodelay(true)?;
+    #[cfg(target_os = "macos")]
+    const KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
+    #[cfg(not(target_os = "macos"))]
+    const KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+    let secs = KEEPALIVE.as_secs() as libc::c_int;
+    let opts = [(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1), (libc::IPPROTO_TCP, KEEPIDLE, secs), (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, secs), (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)];
+    for (level, name, value) in opts {
+        // SAFETY: an int option on a socket the caller owns.
+        if unsafe { libc::setsockopt(s.as_raw_fd(), level, name, (&raw const value).cast(), size_of::<libc::c_int>() as libc::socklen_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// What containers reach as `host.docker.internal`.
@@ -1158,6 +1161,55 @@ mod tests {
         let lines = [TCP[1], TCP[3].replace("0200A8C0:11D7", "0100007F:11D7").replace(" 01 ", " 0A ").as_str()].map(str::to_owned);
         assert_eq!(listening(&lines, false), (vec![4567], vec![]));
         assert_eq!(listening(&["garbage", "1: zz:11D7 0:0 0A", ""], false), (vec![], vec![]));
+    }
+
+    /// An idle connection is never timed out (#388); keepalive finds dead peers.
+    #[test]
+    fn relayed_connections_have_no_idle_timeout_and_keep_alive() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        let opt = |s: &TcpStream, level, name| {
+            let (mut v, mut len): (libc::c_int, libc::socklen_t) = (0, size_of::<libc::c_int>() as _);
+            // SAFETY: reads an int option into `v`.
+            assert_eq!(unsafe { libc::getsockopt(s.as_raw_fd(), level, name, (&raw mut v).cast(), &mut len) }, 0);
+            v
+        };
+        for direct in [true, false] {
+            let (front, back) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+            let port = back.local_addr().unwrap().port();
+            let mut client = TcpStream::connect(front.local_addr().unwrap()).unwrap();
+            let accepted = front.accept().unwrap().0;
+            // A clone shares the socket, so it reads back what the relay set.
+            let mut ends = vec![accepted.try_clone().unwrap()];
+            let relay = if direct {
+                std::thread::spawn(move || super::relay_direct(accepted, [127, 0, 0, 1], port))
+            } else {
+                let guest = TcpStream::connect(back.local_addr().unwrap()).unwrap();
+                ends.push(guest.try_clone().unwrap());
+                std::thread::spawn(move || super::relay_tcp(accepted, guest))
+            };
+            // Fails, not hangs, when the relay never connects.
+            back.set_nonblocking(true).unwrap();
+            let mut server = loop {
+                match back.accept() {
+                    Ok((s, _)) => break s,
+                    Err(_) if !relay.is_finished() => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    Err(_) => panic!("relay ended without connecting: {:?}", relay.join()),
+                }
+            };
+            server.set_nonblocking(false).unwrap();
+            client.write_all(b"x").unwrap();
+            server.read_exact(&mut [0]).unwrap();
+            for s in &ends {
+                assert_eq!((s.read_timeout().unwrap(), s.write_timeout().unwrap()), (None, None), "direct={direct}");
+                assert_ne!(opt(s, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0, "direct={direct}");
+                assert_eq!(opt(s, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 15, "direct={direct}");
+                assert_eq!(opt(s, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 9, "direct={direct}");
+            }
+            drop((client, server));
+            relay.join().unwrap().unwrap();
+        }
     }
 
     #[test]
