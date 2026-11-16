@@ -10,6 +10,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use kiri_proto::{ExecSpec, RunSpec, StrList, net_opts, run_flags};
@@ -1226,6 +1227,8 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
         libc::umount2(c".".as_ptr(), libc::MNT_DETACH);
         libc::chdir(c"/".as_ptr());
     }
+    // As runc: create a missing working directory as root, 0755, before the root goes read-only.
+    let _ = fs::DirBuilder::new().recursive(true).mode(0o755).create(std::ffi::OsStr::from_bytes(p.cwd.as_bytes()));
     if p.readonly_rootfs {
         // Only the root itself: volumes, tmpfs and /dev stay as they are.
         sys::mount(c"none", c"/", c"none", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, None).unwrap_or_else(|e| fail("read-only root", e));
@@ -1372,11 +1375,7 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
             fail("switch user", io::Error::last_os_error());
         }
         if libc::chdir(p.cwd.as_ptr()) != 0 {
-            // Docker creates the whole working directory path, like mkdir -p.
-            let _ = fs::create_dir_all(std::ffi::OsStr::from_encoded_bytes_unchecked(p.cwd.as_bytes()));
-            if libc::chdir(p.cwd.as_ptr()) != 0 {
-                fail("working directory", io::Error::last_os_error());
-            }
+            fail("working directory", io::Error::last_os_error());
         }
     }
 

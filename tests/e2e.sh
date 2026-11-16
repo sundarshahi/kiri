@@ -130,6 +130,11 @@ t env "bar" $D run --rm -e FOO=bar alpine sh -c 'echo $FOO'
 t env-image "PATH=/usr/local/sbin" $D run --rm alpine env
 t workdir "/tmp" $D run --rm -w /tmp alpine pwd
 t workdir-created "/made/here" $D run --rm -w /made/here alpine pwd
+# As runc: a start makes it as root, 0755, so a non-root user starts there too (#370).
+t workdir-created-as-user "/made/for/user" $D run --rm -u 1000:1000 -w /made/for/user alpine pwd
+t workdir-created-root-owned "0:0 755" $D run --rm -u 1000 -w /made/owned alpine stat -c '%u:%g %a' /made/owned
+t workdir-created-in-volume "/data/sub" $D run --rm -u 1000 -v /data -w /data/sub alpine pwd
+t workdir-created-read-only "/made/ro" $D run --rm --read-only -u 1000 -w /made/ro alpine pwd
 t user-numeric "uid=1000" $D run --rm -u 1000 alpine id
 t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
@@ -201,6 +206,8 @@ code exec-exit 3 $D exec web sh -c 'exit 3'
 t exec-env "e-val" $D exec -e E=e-val web sh -c 'echo $E'
 t exec-user "nginx" $D exec -u nginx web id -un
 t exec-workdir "/etc" $D exec -w /etc web pwd
+# As runc: only a start makes a missing working directory, not an exec.
+t exec-workdir-missing "such file or directory" $D exec -w /exec/missing web pwd
 t exec-stdin "into exec" bash -c "echo 'into exec' | $D exec -i web cat"
 t exec-tty "/dev/pts" bash -c "script -q /dev/null $D exec -it web tty < /dev/null"
 t exec-sees-pid1 "nginx" $D exec web sh -c 'cat /proc/1/comm'
