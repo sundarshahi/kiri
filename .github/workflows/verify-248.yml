@@ -20,6 +20,15 @@ jobs:
               -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
               'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
           done
+      - name: fmt and clippy for kiri-init on Linux (main vs the fix)
+        run: |
+          for e in base head; do
+            docker run --rm -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && rustup component add clippy rustfmt >/dev/null 2>&1; cargo clippy --locked -p kiri-init 2>&1 | grep -E "^(warning|error)" | sort | uniq -c | sort -rn > /src/../clippy-'$e'.txt; rustfmt --edition 2021 --config max_width=160 --check crates/kiri-init/src/linux/pid1.rs >/dev/null 2>&1; echo "'$e' pid1.rs rustfmt(160) exit=$?"'
+          done
+          echo "== clippy lines only on the fix:"; diff <(sort clippy-base.txt) <(sort clippy-head.txt) | grep '^>' || echo none
+          docker run --rm -v "$PWD/head:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+            'apk add -q musl-dev; cargo clippy --locked -p kiri-init 2>&1 | grep -B2 -A8 "pid1.rs" | head -40 || true'
       - name: Start both engines
         run: |
           for e in base head; do
