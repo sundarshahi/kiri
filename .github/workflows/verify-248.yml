@@ -3,51 +3,81 @@ on:
   push:
     branches: [verify/248]
 jobs:
-  repro:
+  verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with: { path: head, ref: fix/248-init-holds-dns-sockets }
+      - uses: actions/checkout@v4
         with: { path: base, ref: main, repository: libracoder/kiri }
-      - name: Build main (static, as cargo xtask linux)
+      - name: Build main and the fix
         run: |
-          mkdir -p "$RUNNER_TEMP/base-bin"
-          docker run --rm -v "$PWD/base:/src" -v "$RUNNER_TEMP/base-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
-            -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
-            'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
-      - name: Repro
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            mkdir -p "$RUNNER_TEMP/$e-bin"
+            docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/$e-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+              -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+          done
+      - name: Start both engines
+        run: |
+          for e in base head; do
+            W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+            docker run -d --name kiri-$e --privileged --tmpfs /run -v kiri-lib-$e:/var/lib/kiri -v kiri-store-$e:/root/.local/share/kiri \
+              -v "$RUNNER_TEMP/$e-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+            i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+            sudo docker context create kiri-$e --docker host=unix://$W/docker.sock >/dev/null
+            sudo docker --context kiri-$e pull -q alpine:3.21 >/dev/null
+          done
+      - name: The issue's case, 3 times each
         run: |
           set +e
-          W=$RUNNER_TEMP/run; mkdir -p "$W"
-          docker run -d --name kiri --privileged --tmpfs /run -v kiri-lib:/var/lib/kiri -v kiri-store:/root/.local/share/kiri -v "$RUNNER_TEMP/base-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
-            alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
-          i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
-          D="sudo docker -H unix://$W/docker.sock"
-          ls53() { echo "  :53 listeners: $(docker exec kiri netstat -lun 2>/dev/null | awk '$4 ~ /:53$/ {print $4}' | tr '\n' ' ')"; }
-          sub() { $D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$1"; }
-          $D pull -q alpine:3.21 >/dev/null
-          echo "== A: run, rm network, same subnet again (no --init)"
-          $D network create a1 >/dev/null; echo "a1 $(sub a1)"; $D run --rm --network a1 alpine:3.21 true; echo "run a1 exit=$?"
-          $D network rm a1 >/dev/null; ls53
-          $D network create a2 >/dev/null; echo "a2 $(sub a2)"; $D run --rm --network a2 alpine:3.21 true; echo "run a2 exit=$?"
-          $D network rm a2 >/dev/null; ls53
-          echo "== B: an --init container started while b1's DNS server exists"
-          $D network create b1 >/dev/null; echo "b1 $(sub b1)"
-          $D run -d --name b1c --network b1 alpine:3.21 sleep 600 >/dev/null
-          $D run -d --name keeper --init alpine:3.21 sleep 600 >/dev/null
-          $D rm -f b1c >/dev/null; $D network rm b1 >/dev/null; ls53
-          $D network create b2 >/dev/null; echo "b2 $(sub b2)"; $D run --rm --network b2 alpine:3.21 true; echo "run b2 exit=$?"
-          echo "  holders of :53 sockets:"; docker exec kiri sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); n=$(ls -l $p/fd 2>/dev/null | grep -c socket); [ "$n" -gt 0 ] && echo "   pid ${p#/proc/} sockets=$n $c"; done' | head -20
-          $D rm -f keeper >/dev/null; sleep 1; ls53
-          $D run --rm --network b2 alpine:3.21 true; echo "run b2 after keeper gone exit=$?"
-          $D network rm b2 >/dev/null
-          echo "== C: same as B without --init"
-          $D network create c1 >/dev/null; echo "c1 $(sub c1)"
-          $D run -d --name c1c --network c1 alpine:3.21 sleep 600 >/dev/null
-          $D run -d --name keeper2 alpine:3.21 sleep 600 >/dev/null
-          $D rm -f c1c >/dev/null; $D network rm c1 >/dev/null; ls53
-          $D network create c2 >/dev/null; echo "c2 $(sub c2)"; $D run --rm --network c2 alpine:3.21 true; echo "run c2 exit=$?"
-          echo "== D: a failed start"
-          $D network create d1 >/dev/null; echo "d1 $(sub d1)"; $D run --rm --network d1 alpine:3.21 /nonexistent; echo "run d1 exit=$?"
-          $D network rm d1 >/dev/null; ls53
-          $D network create d2 >/dev/null; echo "d2 $(sub d2)"; $D run --rm --network d2 alpine:3.21 true; echo "run d2 exit=$?"
+          for e in base head; do
+            D="sudo docker --context kiri-$e"
+            for n in 1 2 3; do
+              $D network create n1 >/dev/null; s1=$($D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' n1)
+              $D run -d --name n1c --network n1 alpine:3.21 sleep 600 >/dev/null
+              $D run -d --name keeper --init alpine:3.21 sleep 600 >/dev/null
+              $D rm -f n1c >/dev/null; $D network rm n1 >/dev/null
+              l=$(docker exec kiri-$e netstat -lun | awk '$4 ~ /:53$/ {print $4}' | tr '\n' ' ')
+              $D network create n2 >/dev/null; s2=$($D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' n2)
+              out=$($D run --rm --network n2 alpine:3.21 echo started 2>&1 | tail -1)
+              echo "$e run $n: n1=$s1 n2=$s2 :53 after rm=[$l] -> $out"
+              $D rm -f keeper >/dev/null; $D network rm n2 >/dev/null
+            done
+          done
+      - name: An --init PID 1 and other containers' stdin
+        run: |
+          set +e
+          for e in base head; do
+            D="sudo docker --context kiri-$e"
+            start=$(date +%s)
+            ( sleep 4; echo hi ) | timeout 25 $D run -i --rm --name catter alpine:3.21 cat > /tmp/cat-$e 2>&1 &
+            sleep 2; $D run -d --name keeper3 --init alpine:3.21 sleep 600 >/dev/null
+            wait $!; rc=$?
+            echo "$e: cat with stdin closed at 4s -> exit=$rc after $(( $(date +%s)-start ))s output=$(cat /tmp/cat-$e | tr '\n' ' ')"
+            $D rm -f keeper3 catter >/dev/null 2>&1
+          done
+      - name: --init itself still behaves
+        run: |
+          set +e
+          for e in base head; do
+            D="sudo docker --context kiri-$e"
+            $D run --rm --init alpine:3.21 sh -c 'exit 7'; echo "$e exit code: $?"
+            echo "$e fds in PID 1: $($D run --rm --init alpine:3.21 sh -c 'ls /proc/1/fd | tr "\n" " "')"
+            $D run -d --name sig --init alpine:3.21 sleep 600 >/dev/null; t0=$(date +%s%N)
+            $D stop -t 10 sig >/dev/null; echo "$e stop took $(( ($(date +%s%N)-t0)/1000000 )) ms, exit $($D inspect -f '{{.State.ExitCode}}' sig)"; $D rm sig >/dev/null
+            echo "$e tty: $($D run --rm -t --init alpine:3.21 sh -c 'tty; echo ok' | tr -d '\r' | tr '\n' ' ')"
+          done
+      - name: Full e2e suite, main vs the fix
+        run: |
+          set +e
+          for e in base head; do
+            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e HOME=$HOME timeout 2400 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
+            echo "$e e2e exit=$?"; tail -4 $RUNNER_TEMP/e2e-$e.log
+            grep -E "^  FAIL" $RUNNER_TEMP/e2e-$e.log | sed 's/:.*//' | sort > $RUNNER_TEMP/fails-$e
+          done
+          echo "== failing only on the fix:"; comm -13 $RUNNER_TEMP/fails-base $RUNNER_TEMP/fails-head
+          echo "== failing only on main:"; comm -23 $RUNNER_TEMP/fails-base $RUNNER_TEMP/fails-head
+          grep -n "network-rm-init-dns" $RUNNER_TEMP/e2e-*.log
