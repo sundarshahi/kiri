@@ -1,0 +1,67 @@
+name: verify-228
+on:
+  push:
+    branches: [verify/228]
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head, ref: fix/228-pool-ignores-gateway-routes }
+      - uses: actions/checkout@v4
+        with: { path: base, ref: main, repository: libracoder/kiri }
+      - name: Build main and the fix (static, as cargo xtask linux)
+        run: |
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            mkdir -p "$RUNNER_TEMP/$e-bin"
+            docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/$e-bin:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+              -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+          done
+      - name: Unit tests and clippy (Linux)
+        run: |
+          docker run --rm -v "$PWD/head:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+            'apk add -q musl-dev && rustup component add clippy >/dev/null 2>&1; cargo test --locked -p kiri --bin kiri network:: 2>&1 | tail -15 && cargo clippy --locked -p kiri 2>&1 | tail -5'
+      - name: Docker Engine with the same routes (parity)
+        run: |
+          docker version -f 'Docker Engine {{.Server.Version}}'
+          gw=$(ip -4 route show default | awk '{print $3; exit}')
+          sudo ip route add 0.0.0.0/1 via "$gw"
+          sudo ip route add 128.0.0.0/1 via "$gw"
+          ip -4 route
+          docker network create -d=bridge -o com.docker.network.bridge.enable_ip_masquerade=true --ipv6 --subnet fc00:f853:ccd:e793::/64 kind
+          docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' kind
+          docker network rm kind
+          sudo ip route del 0.0.0.0/1 via "$gw"
+          sudo ip route del 128.0.0.0/1 via "$gw"
+      - name: Kiri main vs fix, with OpenVPN def1 routes
+        run: |
+          set +e
+          for e in base head; do
+            echo "::group::$e"
+            W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+            docker run -d --name kiri-$e --privileged --tmpfs /run -v "$RUNNER_TEMP/$e-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" \
+              alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+            i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+            D="docker -H unix://$W/docker.sock"
+            docker exec kiri-$e sh -c 'gw=$(ip route | awk "/^default/{print \$3}"); ip route add 0.0.0.0/1 via $gw; ip route add 128.0.0.0/1 via $gw; ip -4 route'
+            for n in 1 2 3; do
+              start=$(date +%s%N)
+              out=$($D network create -d=bridge -o com.docker.network.bridge.enable_ip_masquerade=true --ipv6 --subnet fc00:f853:ccd:e793::/64 kind 2>&1)
+              echo "$e try $n: kind network create -> $out ($(( ($(date +%s%N)-start)/1000000 )) ms)"
+              $D network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' kind 2>&1
+              $D network rm kind >/dev/null 2>&1
+            done
+            echo "plain create: $($D network create probe 2>&1)"; $D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' probe 2>&1
+            echo "container on it, out through the /1 routes:"
+            $D run --rm --network probe alpine:3.21 sh -c 'ip -4 -o addr show eth0 | awk "{print \$4}"; wget -q -O /dev/null https://registry.npmjs.org/ && echo outbound-ok' 2>&1 | tail -3
+            # An on-link route still keeps the pool off that subnet.
+            next=$($D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' probe 2>/dev/null | awk -F. '{print $2+1}')
+            docker exec kiri-$e ip route add 172.$next.0.0/16 dev eth0
+            echo "on-link 172.$next.0.0/16 added; probe2: $($D network create probe2 2>&1)"; $D network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' probe2 2>&1
+            echo "::endgroup::"
+          done
+          docker logs kiri-head 2>&1 | tail -5
