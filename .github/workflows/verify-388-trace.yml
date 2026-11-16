@@ -1,0 +1,35 @@
+name: verify-388-trace
+on:
+  push:
+    branches: [verify/388]
+    paths: ['.github/workflows/verify-388-trace.yml']
+jobs:
+  trace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: base, ref: 231d2301865add70ac4bbac6beef01d94e0e95da, repository: libracoder/kiri }
+      - name: Build main
+        run: |
+          mkdir -p "$RUNNER_TEMP/base-bin"
+          docker run --rm -v "$PWD/base:/src" -v "$RUNNER_TEMP/base-bin:/out" -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+            'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+      - name: Trace main's relay through a 320 s idle connection
+        run: |
+          sudo apt-get install -y -qq strace >/dev/null
+          W=$RUNNER_TEMP/base-run; mkdir -p "$W"
+          docker run -d --name kiri-base --privileged --tmpfs /run -v kiri-lib:/var/lib/kiri -v kiri-store:/root/.local/share/kiri -v "$RUNNER_TEMP/base-bin:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+          i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+          sudo docker context create kiri-base --docker "host=unix://$W/docker.sock" >/dev/null
+          sudo docker --context kiri-base run -d --name idle-test -p 127.0.0.1:16379:6379 valkey/valkey:8-alpine >/dev/null
+          sleep 3
+          pid=$(docker inspect -f '{{.State.Pid}}' kiri-base)
+          sudo strace -f -tt -p $pid -e trace=accept4,connect,setsockopt,splice,shutdown,read,recvfrom -o $RUNNER_TEMP/trace.txt &
+          sleep 2
+          docker exec kiri-base sh -c "s=\$(date +%s); r=\$( (sleep 320; printf 'PING\r\n'; sleep 3) | nc 127.0.0.1 16379 | tr -d '\r'); echo \"main idle 320 s: reply='\$r', ended after \$(( \$(date +%s)-s )) s\"" &
+          sleep 15; docker exec kiri-base sh -c 'netstat -tnp 2>/dev/null | grep -E "16379|6379"'
+          sleep 290; echo "at ~305 s:"; docker exec kiri-base sh -c 'netstat -tnp 2>/dev/null | grep -E "16379|6379"'
+          wait %2
+          sudo kill %1; sleep 1
+          grep -vE 'read\([0-9]+, .*(EAGAIN|= [0-9]+$)' $RUNNER_TEMP/trace.txt | grep -E 'accept4|connect\(|SO_RCVTIMEO|SO_SNDTIMEO|splice|shutdown' | head -60
