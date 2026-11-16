@@ -2,6 +2,7 @@ name: verify-388
 on:
   push:
     branches: [verify/388]
+    paths: ['crates/**']
   workflow_dispatch:
 jobs:
   verify:

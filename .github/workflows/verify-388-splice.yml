@@ -1,0 +1,30 @@
+name: verify-388-splice
+on:
+  push:
+    branches: [verify/388]
+    paths: ['.github/workflows/verify-388-splice.yml']
+jobs:
+  splice:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Does SO_RCVTIMEO end a blocked read() and a blocked splice() on this kernel?
+        run: |
+          uname -r
+          python3 - <<'PY'
+          import os, signal, socket, struct, time
+          def alarm(*_): raise TimeoutError("still blocked after 10 s")
+          signal.signal(signal.SIGALRM, alarm)
+          for mode in ["read", "splice"]:
+              l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen()
+              c = socket.create_connection(l.getsockname()); a, _ = l.accept()
+              a.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, struct.pack("ll", 3, 0))
+              r, w = os.pipe()
+              t = time.time(); signal.alarm(10)
+              try:
+                  a.recv(10) if mode == "read" else os.splice(a.fileno(), w, 65536)
+                  res = "returned"
+              except Exception as e:
+                  res = repr(e)
+              signal.alarm(0)
+              print(f"{mode}: {res} after {time.time() - t:.1f} s (SO_RCVTIMEO 3 s)")
+          PY
