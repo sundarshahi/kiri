@@ -84,7 +84,7 @@ jobs:
         run: |
           set +e
           for e in base head; do
-            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e HOME=$HOME timeout 2400 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
+            ( cd head && sudo env DOCKER_CONTEXT=kiri-$e timeout 2400 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
             echo "$e e2e exit=$?"; tail -4 $RUNNER_TEMP/e2e-$e.log
             grep -E "^  FAIL" $RUNNER_TEMP/e2e-$e.log | sed 's/:.*//' | sort > $RUNNER_TEMP/fails-$e
           done
