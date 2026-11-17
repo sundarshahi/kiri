@@ -1,0 +1,154 @@
+name: verify-378
+on:
+  push:
+    branches: [verify/378]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head }
+      - uses: actions/checkout@v4
+        with: { path: base, ref: 1bfdaa22cd1b9ae0ad7fda8c9fd7eb2d9cc5c8ad, repository: libracoder/kiri }
+      - name: Build main and the fix
+        run: |
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            mkdir -p "$RUNNER_TEMP/bins/$e"
+            docker run --rm -v "$PWD/$e:/src" -v "$RUNNER_TEMP/bins/$e:/out" -v t:/t -v reg:/usr/local/cargo/registry \
+              -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && cargo build --release --locked -p kiri -p kiri-init && cp /t/release/kiri /t/release/kiri-init /out/'
+          done
+      - uses: actions/upload-artifact@v4
+        with: { name: bins, path: "${{ runner.temp }}/bins" }
+      - name: clippy and unit tests on Linux (main vs the fix)
+        run: |
+          for e in base head; do
+            find "$e" -type f -exec touch {} +
+            docker run --rm --privileged -v "$PWD/$e:/src" -v t:/t -v reg:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/t rust:1-alpine sh -c \
+              'apk add -q musl-dev && rustup component add clippy >/dev/null 2>&1; cargo clippy --locked -p kiri -p kiri-init --all-targets 2>&1 | grep -E -A3 "^(warning|error)" | grep -E "^(warning|error)|-->" | sed "s/:[0-9]*:[0-9]*$//" | sort | uniq -c | sort -rn > /src/clippy.txt; cargo test --locked -p kiri-init 2>&1 | grep -E "^test result|FAILED|panicked" > /src/test.txt; cargo test --locked -p kiri hostopts 2>&1 | grep -E "^test |^test result|FAILED|panicked" >> /src/test.txt'
+            echo "== $e clippy:"; cat $e/clippy.txt; echo "== $e tests:"; cat $e/test.txt
+          done
+          echo "== clippy lines that differ (< main, > fix):"; diff base/clippy.txt head/clippy.txt || true
+  cases:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: bins, path: "${{ runner.temp }}/bins" }
+      - name: Start both engines
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          chmod +x $RUNNER_TEMP/bins/*/*
+          for e in base head; do
+            W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+            docker run -d --name kiri-$e --privileged --tmpfs /run -v kiri-lib-$e:/var/lib/kiri -v kiri-store-$e:/root/.local/share/kiri \
+              -v "$RUNNER_TEMP/bins/$e:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+            i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+            sudo docker context create kiri-$e --docker host=unix://$W/docker.sock >/dev/null
+          done
+          for c in default kiri-base kiri-head; do sudo docker --context $c pull -q alpine >/dev/null; done
+          sudo docker version --format 'Docker {{.Server.Version}}'; uname -r
+      - name: Cases, Docker vs Kiri main vs the fix
+        run: |
+          set +e
+          one() { # engine, command...: "exit N: output" on one line
+            local c=$1; shift
+            local out; out=$(timeout 150 sudo docker --context $c "$@" 2>&1); local rc=$?
+            printf 'exit %s: %s' "$rc" "$(printf %s "$out" | tr '\n' ' ' | sed 's/|/\\|/g' | cut -c1-220)"
+          }
+          api() { # engine, json: create through the API, then start -a and remove
+            local c=$1 sock
+            sock=$(sudo docker context inspect $c --format '{{.Endpoints.docker.Host}}'); sock=${sock#unix://}
+            local r; r=$(sudo curl -s --unix-socket $sock -H 'Content-Type: application/json' -d "$2" http://d/containers/create)
+            local id; id=$(printf %s "$r" | sed -n 's/.*"Id":"\([0-9a-f]*\)".*/\1/p')
+            [ -z "$id" ] && { printf 'create: %s' "$r"; return 1; }
+            sudo docker --context $c start -a $id; local rc=$?; sudo docker --context $c rm -f $id >/dev/null; return $rc
+          }
+          row() { # name, command...
+            local name=$1; shift
+            local cells=""
+            for c in default kiri-base kiri-head; do cells="$cells | $(one $c "$@")"; done
+            echo "| $name$cells |" | tee -a $RUNNER_TEMP/table.md
+          }
+          arow() { # name, json
+            local name=$1 cells="" c out rc
+            for c in default kiri-base kiri-head; do
+              out=$(timeout 150 bash -c "$(declare -f api); api $c '$2'" 2>&1); rc=$?
+              cells="$cells | exit $rc: $(printf %s "$out" | tr '\n' ' ' | sed 's/|/\\|/g' | cut -c1-220)"
+            done
+            echo "| $name$cells |" | tee -a $RUNNER_TEMP/table.md
+          }
+          echo "| case | Docker | Kiri main | Kiri fix |" > $RUNNER_TEMP/table.md
+          echo "|---|---|---|---|" >> $RUNNER_TEMP/table.md
+          P='echo "covered[$(grep -oE " /(proc/[a-z_-]+|sys/firmware|sys/devices/virtual/powercap) " /proc/self/mountinfo | sort -u | xargs)]"; [ -w /proc/sys/kernel/core_pattern ] && echo sys-writable || echo sys-readonly'
+          row "default" run --rm alpine sh -c "$P"
+          row "systempaths=unconfined" run --rm --security-opt systempaths=unconfined alpine sh -c "$P"
+          row "--privileged" run --rm --privileged alpine sh -c "$P"
+          row "--privileged + systempaths=unconfined" run --rm --privileged --security-opt systempaths=unconfined alpine sh -c "$P"
+          row "default: write to /proc/sys refused" run --rm alpine sh -c 'cat /proc/sys/kernel/sysrq > /proc/sys/kernel/sysrq'
+          row "seccomp=unconfined alone keeps the masks" run --rm --security-opt seccomp=unconfined alpine sh -c "$P"
+          row "--cap-add SYS_ADMIN alone keeps the masks" run --rm --cap-add SYS_ADMIN alpine sh -c "$P"
+          for c in default kiri-base kiri-head; do
+            sudo docker --context $c create --name sp-def alpine >/dev/null
+            sudo docker --context $c create --name sp-unc --security-opt systempaths=unconfined alpine >/dev/null
+            sudo docker --context $c create --name sp-priv --privileged alpine >/dev/null
+          done
+          row "inspect default: MaskedPaths ReadonlyPaths" inspect -f '{{json .HostConfig.MaskedPaths}} {{json .HostConfig.ReadonlyPaths}}' sp-def
+          row "inspect systempaths=unconfined" inspect -f '{{json .HostConfig.MaskedPaths}} {{json .HostConfig.ReadonlyPaths}}' sp-unc
+          row "inspect --privileged" inspect -f '{{json .HostConfig.MaskedPaths}} {{json .HostConfig.ReadonlyPaths}}' sp-priv
+          for c in default kiri-base kiri-head; do sudo docker --context $c rm -f sp-def sp-unc sp-priv >/dev/null; done
+          Q='echo os:[$(cat /etc/os-release | head -1)]; touch /tmp/x 2>/dev/null && echo tmp-rw || echo tmp-ro; echo covered[$(grep -oE \" /(proc/[a-z_-]+|sys/firmware|sys/devices/virtual/powercap) \" /proc/self/mountinfo | sort -u | xargs)]'
+          arow "API MaskedPaths=[] only" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"$Q\"],\"HostConfig\":{\"MaskedPaths\":[]}}"
+          arow "API ReadonlyPaths=[] only" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"$Q\"],\"HostConfig\":{\"ReadonlyPaths\":[]}}"
+          arow "API custom lists" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"$Q\"],\"HostConfig\":{\"MaskedPaths\":[\"/etc/os-release\",\"/nope\"],\"ReadonlyPaths\":[\"/tmp\",\"/proc/sys\"]}}"
+          arow "API custom MaskedPaths + Privileged" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"$Q\"],\"HostConfig\":{\"Privileged\":true,\"MaskedPaths\":[\"/etc/os-release\"]}}"
+          arow "API masks a dir (/srv) and a volume path" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"touch /data/f; ls -a /srv /data | xargs; $Q\"],\"HostConfig\":{\"Binds\":[\"v378:/data\"],\"MaskedPaths\":[\"/srv\",\"/data\"]}}"
+          arow "API relative MaskedPaths entry" "{\"Image\":\"alpine\",\"Cmd\":[\"true\"],\"HostConfig\":{\"MaskedPaths\":[\"proc/kcore\"]}}"
+          arow "API null lists (as an old client sends)" "{\"Image\":\"alpine\",\"Cmd\":[\"sh\",\"-c\",\"$Q\"],\"HostConfig\":{\"MaskedPaths\":null,\"ReadonlyPaths\":null}}"
+          B='timeout 60 apk add -q bubblewrap >/dev/null 2>&1; timeout 15 su nobody -s /bin/sh -c "bwrap --die-with-parent --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev echo bwrap-ok" 2>&1'
+          row "bwrap: issue flags (nnp, seccomp+systempaths unconfined)" run --rm --security-opt no-new-privileges:true --security-opt seccomp=unconfined --security-opt systempaths=unconfined alpine sh -c "$B"
+          row "bwrap: issue flags + apparmor=unconfined" run --rm --security-opt no-new-privileges:true --security-opt seccomp=unconfined --security-opt systempaths=unconfined --security-opt apparmor=unconfined alpine sh -c "$B"
+          row "bwrap: seccomp+apparmor unconfined, no systempaths" run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined alpine sh -c "$B"
+          row "bwrap: default" run --rm alpine sh -c "$B"
+          row "bwrap: --privileged" run --rm --privileged alpine sh -c "$B"
+          for c in default kiri-base kiri-head; do sudo docker --context $c volume rm v378 >/dev/null 2>&1; done
+          cat $RUNNER_TEMP/table.md >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: table, path: "${{ runner.temp }}/table.md" }
+  e2e:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: { e: [base, head] }
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: head }
+      - uses: actions/download-artifact@v4
+        with: { name: bins, path: "${{ runner.temp }}/bins" }
+      - name: Start the engine
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          chmod +x $RUNNER_TEMP/bins/*/*
+          e=${{ matrix.e }}; W=$RUNNER_TEMP/$e-run; mkdir -p "$W"
+          docker run -d --name kiri-$e --privileged --tmpfs /run -v kiri-lib-$e:/var/lib/kiri -v kiri-store-$e:/root/.local/share/kiri \
+            -v "$RUNNER_TEMP/bins/$e:/opt/kiri:ro" -v "$W:/root/.kiri/run" alpine:3.21 sh -c 'exec /opt/kiri/kiri daemon' >/dev/null
+          i=0; while [ ! -S "$W/docker.sock" ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.5; done
+          sudo docker context create kiri-$e --docker host=unix://$W/docker.sock >/dev/null
+      - name: Full e2e suite
+        run: |
+          set +e
+          e=${{ matrix.e }}
+          ( cd head && sudo env DOCKER_CONTEXT=kiri-$e timeout 12000 bash tests/e2e.sh > $RUNNER_TEMP/e2e-$e.log 2>&1 )
+          echo "$e e2e exit=$?"; tail -6 $RUNNER_TEMP/e2e-$e.log
+          echo "== failures:"; grep -E "^  FAIL" $RUNNER_TEMP/e2e-$e.log
+          echo "== systempaths:"; grep -n -A3 "systempaths" $RUNNER_TEMP/e2e-$e.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "e2e-${{ matrix.e }}", path: "${{ runner.temp }}/e2e-*.log" }
