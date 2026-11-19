@@ -1,0 +1,48 @@
+name: verify-nirmala
+on:
+  push:
+    branches: [verify/nirmala]
+jobs:
+  font:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Nirmala UI language forms
+        shell: pwsh
+        run: |
+          pip install -q fonttools==4.55.3
+          Get-ChildItem C:\Windows\Fonts\Nirmala* | Select-Object Name, Length
+          @'
+          import glob
+          from fontTools.ttLib import TTCollection, TTFont
+          for path in glob.glob(r"C:\Windows\Fonts\Nirmala*"):
+              f = TTCollection(path).fonts[0] if path.lower().endswith(".ttc") else TTFont(path)
+              cmap = {v: k for k, v in f.getBestCmap().items()}
+              g = f["GSUB"].table
+              for sr in g.ScriptList.ScriptRecord:
+                  if sr.ScriptTag not in ("dev2", "deva"): continue
+                  tags = [lr.LangSysTag.strip() for lr in sr.Script.LangSysRecord]
+                  print(path, sr.ScriptTag, "language systems:", tags)
+                  for lr in sr.Script.LangSysRecord:
+                      if lr.LangSysTag.strip() != "NEP": continue
+                      for fi in lr.LangSys.FeatureIndex:
+                          fr = g.FeatureList.FeatureRecord[fi]
+                          if fr.FeatureTag != "locl": continue
+                          for li in fr.Feature.LookupListIndex:
+                              for st in g.LookupList.Lookup[li].SubTable:
+                                  st = getattr(st, "ExtSubTable", st)
+                                  for a, b in getattr(st, "mapping", {}).items():
+                                      print("  NEP locl:", hex(cmap[a]) if a in cmap else a, "->", b)
+          '@ | Set-Content locl.py -Encoding utf8
+          python locl.py
+      - name: Render in Edge (the WebView2 engine)
+        shell: pwsh
+        run: |
+          $rows = foreach ($l in "hi","ne") { "<div><small>Nirmala UI $l</small><span lang=$l style=`"font-family:'Nirmala UI'`">&#x91D; &#x905;&#x91D;&#x948; &#x96B;&#x96E; &#x932; &#x936;</span></div>" }
+          "<meta charset=utf-8><style>body{font-size:40px;margin:10px;background:#fff}small{font:13px sans-serif;display:inline-block;width:200px}</style>$($rows -join '')" | Set-Content t.html -Encoding utf8
+          $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+          & $edge --headless --disable-gpu --window-size=760,220 "--screenshot=$PWD\nirmala.png" "file:///$($PWD.Path.Replace('\','/'))/t.html" | Out-Null
+          Start-Sleep 5
+          Get-Item nirmala.png | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with: { name: nirmala, path: nirmala.png }
